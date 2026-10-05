@@ -1,0 +1,28 @@
+# Default settings for the SAM CLI, so commands stay short (`sam build`, `sam deploy`).
+version = 0.1
+
+[default.global.parameters]
+stack_name = "serverless-task-tracker"
+region = "us-east-1"
+
+[default.build.parameters]
+cached = true
+# Bundle directly from backend/src instead of a temporary copy, so esbuild can
+# resolve imports from ../shared (see the comment on TaskFunction in template.yaml).
+build_in_source = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+# SAM creates an IAM role for the Lambda, which CloudFormation needs permission for.
+capabilities = "CAPABILITY_IAM"
+# Show the list of changes and wait for "y" before creating or changing resources.
+confirm_changeset = true
+# Let SAM manage an S3 bucket for uploading the built code.
+resolve_s3 = true
+parameter_overrides = "Stage=dev AllowedOrigin=http://localhost:5173"
+
+[default.local_start_api.parameters]
+env_vars = "env.local.json"
+docker_network = "task-tracker-local"

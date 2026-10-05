@@ -1,0 +1,15 @@
+# Local development only: runs DynamoDB Local (AWS's free DynamoDB emulator).
+# `sam local start-api` joins the same Docker network so the local Lambda can
+# reach it at http://dynamodb-local:8000. Data is in memory and is lost when
+# the container stops.
+services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: dynamodb-local
+    command: -jar DynamoDBLocal.jar -sharedDb -inMemory
+    ports:
+      - '8000:8000'
+
+networks:
+  default:
+    name: task-tracker-local

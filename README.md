@@ -1,2 +1,207 @@
-# aws-serverless-task-tracker
-Full-stack serverless task tracker built with TypeScript, AWS Lambda, API Gateway, and DynamoDB — deployed on AWS with CI/CD.
+# Serverless Task Tracker
+
+A small full-stack task tracker built on AWS serverless services: React + TypeScript on the front end, and API Gateway (REST) → Lambda (Node.js 22, TypeScript) → DynamoDB on the back end, all defined as infrastructure as code with AWS SAM.
+
+Create, view, edit and delete tasks, set each task's status (`TODO`, `IN_PROGRESS`, `COMPLETED`), and filter the list by status.
+
+> **Status:** backend, infrastructure template, unit tests and local API are done. Frontend and AWS deployment are in progress.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Browser["React app<br/>(Vite)"] -->|HTTPS + JSON| APIGW["API Gateway<br/>REST API"]
+    APIGW -->|Lambda proxy integration| Lambda["Lambda<br/>Node.js 22 (TypeScript)"]
+    Lambda -->|AWS SDK v3| DDB[("DynamoDB<br/>Tasks table + status GSI")]
+    Lambda -->|logs| CW["CloudWatch Logs<br/>(14-day retention)"]
+```
+
+```text
+React ──► API Gateway (REST, CORS, throttling) ──► Lambda ──► DynamoDB
+                                                     │
+                                                     └──► CloudWatch Logs
+```
+
+- **One Lambda serves all five routes.** API Gateway routes each method/path to the same function, and the function dispatches on `httpMethod` + `resource`. For five small CRUD routes this is simpler to deploy, test and reason about than five functions.
+- **Thin handler, separate data layer.** [backend/src/app.ts](backend/src/app.ts) only handles HTTP: routing, validation, status codes and responses. [backend/src/taskRepository.ts](backend/src/taskRepository.ts) is the only code that talks to DynamoDB, behind a `TaskRepository` interface. Unit tests pass in an in-memory fake, so they never call AWS.
+- **Shared types.** [shared/task.ts](shared/task.ts) defines `Task`, the status values and field limits once. Both the Lambda and the React app import it.
+
+## AWS services used
+
+| Service | What it does here |
+|---|---|
+| **Lambda** | Runs the API code (Node.js 22, TypeScript bundled by esbuild). No servers to manage; billed per request and duration. |
+| **API Gateway (REST API)** | Public HTTPS endpoint. Routes requests to Lambda, answers CORS preflight requests, and throttles traffic (10 req/s, burst 20). |
+| **DynamoDB** | Stores tasks. On-demand billing, with a global secondary index for filtering by status. |
+| **IAM** | The Lambda's execution role grants only the 6 DynamoDB actions the code uses, on this table and its index only. No credentials in code. |
+| **CloudWatch Logs** | Lambda logs in JSON format, kept for 14 days. |
+| **CloudFormation (via SAM)** | [template.yaml](template.yaml) defines every resource above, so the whole stack is created, updated and deleted as one unit. |
+
+## Project structure
+
+```text
+shared/            Task type, status values, field limits (used by backend + frontend)
+backend/
+  src/
+    handler.ts     Lambda entry point: reads env vars, wires the real repository
+    app.ts         Routing, validation, HTTP responses (no AWS code)
+    validation.ts  Request body / query / path validation
+    taskRepository.ts  TaskRepository interface + DynamoDB implementation
+  tests/           Vitest unit tests + in-memory repository fake
+  scripts/         create-local-table.mjs (DynamoDB Local setup)
+frontend/          React + TypeScript + Vite app (in progress)
+template.yaml      SAM template: table, API, Lambda, IAM policy, log group
+samconfig.toml     Default SAM CLI settings (stack name, region, parameters)
+docker-compose.yml DynamoDB Local for local development
+env.local.json     Environment variables for `sam local`
+```
+
+## API
+
+Base URL: `http://127.0.0.1:3000` locally, or the `ApiUrl` stack output once deployed. Request and response bodies are JSON.
+
+| Method | Path | Description | Success |
+|---|---|---|---|
+| `GET` | `/tasks` | List tasks, newest first. Optional `?status=TODO\|IN_PROGRESS\|COMPLETED` | `200` + array |
+| `GET` | `/tasks/{id}` | Get one task | `200` + task |
+| `POST` | `/tasks` | Create a task | `201` + task |
+| `PUT` | `/tasks/{id}` | Replace a task's editable fields | `200` + task |
+| `DELETE` | `/tasks/{id}` | Delete a task | `204`, empty body |
+
+**Task:**
+
+```json
+{
+  "id": "48686a7e-0b5d-4f7c-9ad6-ceebc259b73c",
+  "title": "Learn DynamoDB",
+  "description": "GSIs",
+  "status": "TODO",
+  "dueDate": "2026-10-31",
+  "createdAt": "2026-10-05T20:48:20.862Z",
+  "updatedAt": "2026-10-05T20:48:20.862Z"
+}
+```
+
+**Request body** (POST and PUT):
+
+| Field | Rules | Default |
+|---|---|---|
+| `title` | Required, non-empty, at most 200 characters (trimmed) | – |
+| `description` | String, at most 2000 characters | `""` |
+| `status` | `TODO`, `IN_PROGRESS` or `COMPLETED` | `"TODO"` |
+| `dueDate` | `YYYY-MM-DD` (a real calendar date) or `null` | `null` |
+
+`id`, `createdAt` and `updatedAt` are set by the server; sending them, or any other unknown field, is rejected. `PUT` is a full replacement, so omitted optional fields reset to their defaults.
+
+**Errors** always have the shape `{ "message": "..." }`:
+
+| Status | When |
+|---|---|
+| `400` | Invalid JSON, failed validation, unknown status filter, or an id that isn't a UUID |
+| `404` | Task not found, or unknown route |
+| `429` | Throttled by API Gateway |
+| `500` | Unexpected error. The client sees only `Internal server error`; details go to CloudWatch Logs. |
+
+## DynamoDB design
+
+DynamoDB isn't a relational database: you design keys around how the data is **read**, because efficient reads go through keys, not arbitrary `WHERE` clauses.
+
+**Access patterns:**
+
+1. Get, update or delete one task by id
+2. List all tasks
+3. List tasks with a given status
+
+**Table:** partition key `id` (a UUID string). Pattern 1 uses single-item operations (`GetItem` / `UpdateItem` / `DeleteItem`), the cheapest and fastest reads and writes DynamoDB offers. Updates and deletes use condition expressions (`attribute_exists(id)`), so a missing task becomes a clean 404 rather than an accidental "upsert".
+
+**Global secondary index `status-createdAt-index`:** partition key `status`, sort key `createdAt`, projecting all attributes. A GSI is a second copy of the data, kept in sync by DynamoDB, organized by different keys. `GET /tasks?status=X` is a `Query` on this index: it reads **only** the tasks with that status, already sorted newest-first.
+
+**Why a GSI rather than a Scan with a filter?** A `Scan` with `FilterExpression` reads (and bills for) every item in the table, then throws away the non-matching ones. A GSI query reads only what it returns.
+
+**Tradeoffs, honestly:**
+
+- **Writes cost more.** Every write to the table also writes to the index, and the index stores a second copy of each item (`ProjectionType: ALL`). At this scale that's a fraction of a cent.
+- **Low-cardinality partition key.** `status` has only 3 values, so at very high traffic all `TODO` tasks would share one index partition (a "hot partition"). For a single-user app this is irrelevant. At scale, the key would include the user (see below).
+- **Unfiltered `GET /tasks` uses a Scan.** For one user's few hundred tasks, a Scan is a few read units, and sorting in the Lambda is trivial. It does not scale to large tables. With multiple users, a `Query` on a `userId` partition key would replace it.
+- **No pagination in the API (v1).** The repository follows DynamoDB's `LastEvaluatedKey` to return all results. Fine for a personal task list; a larger app would expose a `nextToken`.
+
+**When adding Cognito (multi-user):** change the table key to partition key `userId` + sort key `taskId`, and the GSI to partition key `userId#status` + sort key `createdAt`. Every read then becomes a `Query` scoped to one user, which removes both the Scan and the hot-partition concern. The `TaskRepository` interface would gain a `userId` parameter, and the handler would read it from the Cognito authorizer claims.
+
+**Billing:** on-demand (`PAY_PER_REQUEST`). There's no capacity to plan or pay for while idle, which is the right fit for sporadic personal traffic.
+
+## Security
+
+- **No credentials in code.** In AWS, the Lambda gets temporary credentials from its IAM execution role. Locally, `sam local` uses your AWS CLI profile, and DynamoDB Local accepts dummy credentials.
+- **Least-privilege IAM.** The Lambda's policy in [template.yaml](template.yaml) allows only `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem` and `Scan` on the tasks table, and `Query` only on its status index. It deliberately avoids SAM's broader `DynamoDBCrudPolicy` (which also grants batch operations and more). SAM's standard `AWSLambdaBasicExecutionRole` lets it write logs.
+- **Input validation.** Every body, query parameter and path id is validated, and unknown fields are rejected. See [backend/src/validation.ts](backend/src/validation.ts).
+- **No leaked internals.** Unexpected errors return a generic `500` message. The stack trace is logged to CloudWatch, never sent to the client.
+- **Throttling.** The API has no auth in v1, so API Gateway limits it to 10 requests/s (burst 20) to cap abuse and cost.
+- **CORS is restricted to one origin** (the `AllowedOrigin` parameter, `http://localhost:5173` by default), not `*`. CORS only controls which *websites* a browser lets call the API. It doesn't stop `curl` or scripts (that's what auth and throttling are for), but it prevents a random site from using a visitor's browser to call the API. The Lambda adds the header to its own responses; API Gateway adds it to preflight `OPTIONS` responses and to its own errors (throttling, unknown routes).
+
+## Configuration
+
+| Setting | Where | Purpose |
+|---|---|---|
+| `Stage` | SAM parameter (`samconfig.toml`) | API stage name in the URL, e.g. `dev` |
+| `AllowedOrigin` | SAM parameter | The one origin allowed by CORS |
+| `TABLE_NAME` | Lambda env var, set from the table resource | Table to read and write |
+| `ALLOWED_ORIGIN` | Lambda env var, from `AllowedOrigin` | CORS header in Lambda responses |
+| `DYNAMODB_ENDPOINT` | Lambda env var, empty in AWS | Points `sam local` at DynamoDB Local |
+| `VITE_API_URL` | `frontend/.env.local` | API base URL for the React app |
+
+## Local development
+
+**Prerequisites:** Node.js 20+, AWS CLI v2 (configured), AWS SAM CLI, and Docker Desktop (running).
+
+```bash
+# 1. Install backend dependencies (also needed before every `sam build`)
+cd backend && npm install && cd ..
+
+# 2. Start DynamoDB Local (Docker) and create the local table
+docker compose up -d
+npm --prefix backend run local:table
+
+# 3. Bundle the Lambda and start the API on http://127.0.0.1:3000
+sam build
+sam local start-api
+```
+
+Everything runs on your machine. `sam local` runs the Lambda in a Docker container with the same Node.js 22 runtime as AWS, and samconfig.toml points it at `env.local.json` and the `task-tracker-local` Docker network, so it talks to DynamoDB Local instead of AWS.
+
+Try it:
+
+```bash
+curl -X POST http://127.0.0.1:3000/tasks -H "Content-Type: application/json" -d '{"title":"My first task"}'
+curl http://127.0.0.1:3000/tasks
+curl "http://127.0.0.1:3000/tasks?status=TODO"
+```
+
+After changing backend code, re-run `sam build` (no need to restart `sam local`). DynamoDB Local keeps data in memory, so after `docker compose down` or a restart, run `npm --prefix backend run local:table` again.
+
+Stop everything: `Ctrl+C` in the `sam local` terminal, then `docker compose down`.
+
+## Running tests
+
+```bash
+cd backend
+npm test            # Vitest unit tests (no AWS calls)
+npm run typecheck   # TypeScript type check
+```
+
+The tests call the real handler with API Gateway-shaped events and an in-memory repository. They cover every route, validation failures, 404s, CORS headers and generic 500s.
+
+## Deployment
+
+_Coming in a later step._
+
+## Cleanup
+
+_Coming in a later step._
+
+## Future improvements
+
+- **Authentication with Amazon Cognito** and per-user data (see the DynamoDB design notes above)
+- **CI/CD** (e.g. GitHub Actions running tests and `sam deploy`)
+- **Frontend hosting** on S3 + CloudFront, with `AllowedOrigin` set to the CloudFront domain
+- API pagination with a `nextToken`
+- API Gateway access logs and CloudWatch alarms on Lambda errors

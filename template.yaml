@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless task tracker - API Gateway (REST) + Lambda + DynamoDB
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z0-9]+$'
+    Description: API Gateway stage name, also part of the API URL (e.g. dev, prod).
+  AllowedOrigin:
+    Type: String
+    Default: http://localhost:5173
+    AllowedPattern: '^https?://[^/\s]+$'
+    Description: >-
+      The one browser origin allowed to call the API (CORS), e.g. http://localhost:5173
+      or https://tasks.example.com. Scheme + host (+ port), no trailing slash.
+
+Globals:
+  Api:
+    # Stops SAM from creating an extra, unused stage named "Stage".
+    OpenApiVersion: '3.0'
+
+Resources:
+  # ---------------------------------------------------------------- DynamoDB
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST # on-demand: pay per request, nothing when idle
+      AttributeDefinitions:
+        # Only key attributes are declared; DynamoDB is schemaless otherwise.
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH # partition key: get/update/delete by id are direct lookups
+      GlobalSecondaryIndexes:
+        # Lets GET /tasks?status=X be a Query (reads only matching items, sorted
+        # by createdAt) instead of a Scan of the whole table.
+        - IndexName: status-createdAt-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ---------------------------------------------------------------- API Gateway
+  TaskApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Stage
+      Cors:
+        # Browsers send an OPTIONS "preflight" request before PUT/DELETE and JSON POSTs.
+        # API Gateway answers it directly with these headers (the Lambda is not invoked).
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type'"
+        MaxAge: "'600'"
+      GatewayResponses:
+        # Errors produced by API Gateway itself (throttling, unknown routes) also
+        # need the CORS header, or the browser hides the real error from the app.
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+      MethodSettings:
+        # The API has no auth in v1, so cap request rates to limit abuse and cost.
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingRateLimit: 10
+          ThrottlingBurstLimit: 20
+
+  # ---------------------------------------------------------------- Lambda
+  TaskFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      # SAM bundles the TypeScript with esbuild during `sam build`.
+      # CodeUri is backend/src (no package.json there), so SAM bundles in place
+      # using the packages already installed in backend/node_modules, and can
+      # follow the import of ../shared. Run `npm install` in backend/ first.
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - handler.ts
+        Target: es2022
+        Minify: true
+        Sourcemap: true
+    Properties:
+      CodeUri: backend/src
+      Handler: handler.handler
+      Runtime: nodejs22.x
+      Architectures:
+        - x86_64 # matches most dev machines, so `sam local` runs without emulation
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TasksTable
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+          NODE_OPTIONS: --enable-source-maps # readable stack traces in CloudWatch
+          # Only used by `sam local` to reach DynamoDB Local (see env.local.json).
+          # Empty in AWS, where the SDK uses the regional DynamoDB endpoint.
+          DYNAMODB_ENDPOINT: ''
+      LoggingConfig:
+        LogFormat: JSON # structured logs, easier to search in CloudWatch Logs Insights
+        LogGroup: !Ref TaskFunctionLogGroup
+      Policies:
+        # Least privilege: only the actions the code uses, only on this table.
+        # (SAM also attaches AWSLambdaBasicExecutionRole for writing logs.)
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Scan
+              Resource: !GetAtt TasksTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub '${TasksTable.Arn}/index/status-createdAt-index'
+      Events:
+        ListTasks:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TaskApi
+            Path: /tasks
+            Method: GET
+        CreateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TaskApi
+            Path: /tasks
+            Method: POST
+        GetTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TaskApi
+            Path: /tasks/{id}
+            Method: GET
+        UpdateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TaskApi
+            Path: /tasks/{id}
+            Method: PUT
+        DeleteTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TaskApi
+            Path: /tasks/{id}
+            Method: DELETE
+
+  # ---------------------------------------------------------------- CloudWatch
+  TaskFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-task-function'
+      RetentionInDays: 14 # without this, Lambda logs are kept (and billed) forever
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the API. Use it as VITE_API_URL in frontend/.env.local.
+    Value: !Sub 'https://${TaskApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}'
+  TasksTableName:
+    Description: DynamoDB table name
+    Value: !Ref TasksTable
+  TaskFunctionName:
+    Description: Lambda function name
+    Value: !Ref TaskFunction
+  LogGroupName:
+    Description: CloudWatch log group for the Lambda
+    Value: !Ref TaskFunctionLogGroup
