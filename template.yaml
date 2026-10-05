@@ -73,6 +73,15 @@ Resources:
           ResponseParameters:
             Headers:
               Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        # REST APIs answer unknown paths/methods with a confusing
+        # 403 "Missing Authentication Token". Return a clear 404 instead.
+        MISSING_AUTHENTICATION_TOKEN:
+          StatusCode: '404'
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+          ResponseTemplates:
+            application/json: '{"message":"Route not found"}'
       MethodSettings:
         # The API has no auth in v1, so cap request rates to limit abuse and cost.
         - ResourcePath: '/*'

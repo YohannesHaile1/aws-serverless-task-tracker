@@ -4,7 +4,7 @@ A small full-stack task tracker built on AWS serverless services: React + TypeSc
 
 Create, view, edit and delete tasks, set each task's status (`TODO`, `IN_PROGRESS`, `COMPLETED`), and filter the list by status.
 
-> **Status:** backend, infrastructure template, unit tests and local API are done. Frontend and AWS deployment are in progress.
+The backend is deployed to AWS (`us-east-2`) with SAM. The frontend runs locally against either the local or the deployed API.
 
 ## Architecture
 
@@ -49,7 +49,12 @@ backend/
     taskRepository.ts  TaskRepository interface + DynamoDB implementation
   tests/           Vitest unit tests + in-memory repository fake
   scripts/         create-local-table.mjs (DynamoDB Local setup)
-frontend/          React + TypeScript + Vite app (in progress)
+frontend/
+  src/
+    api.ts         The only code that calls the API; turns failures into readable messages
+    App.tsx        State: task list, filter, editing, loading/error states
+    components/    TaskForm (create + edit), TaskItem, StatusFilter
+  .env.example     Copy to .env.local and set VITE_API_URL
 template.yaml      SAM template: table, API, Lambda, IAM policy, log group
 samconfig.toml     Default SAM CLI settings (stack name, region, parameters)
 docker-compose.yml DynamoDB Local for local development
@@ -98,7 +103,7 @@ Base URL: `http://127.0.0.1:3000` locally, or the `ApiUrl` stack output once dep
 | Status | When |
 |---|---|
 | `400` | Invalid JSON, failed validation, unknown status filter, or an id that isn't a UUID |
-| `404` | Task not found, or unknown route |
+| `404` | Task not found, or unknown route (API Gateway's default 403 "Missing Authentication Token" is remapped to a 404 in the template) |
 | `429` | Throttled by API Gateway |
 | `500` | Unexpected error. The client sees only `Internal server error`; details go to CloudWatch Logs. |
 
@@ -178,7 +183,34 @@ curl "http://127.0.0.1:3000/tasks?status=TODO"
 
 After changing backend code, re-run `sam build` (no need to restart `sam local`). DynamoDB Local keeps data in memory, so after `docker compose down` or a restart, run `npm --prefix backend run local:table` again.
 
-Stop everything: `Ctrl+C` in the `sam local` terminal, then `docker compose down`.
+**Frontend** (in a second terminal):
+
+```bash
+cd frontend
+npm install
+cp .env.example .env.local     # VITE_API_URL=http://127.0.0.1:3000
+npm run dev                    # http://localhost:5173
+```
+
+The dev server is pinned to port 5173 because that's the one origin the API's CORS setting allows.
+
+Stop everything: `Ctrl+C` in the `npm run dev` and `sam local` terminals, then `docker compose down`.
+
+## Frontend
+
+A single-page React app (no router, no state library) with plain CSS that follows the system light/dark setting.
+
+- **List and filter.** Tasks show newest first. The All / To do / In progress / Completed filter calls `GET /tasks?status=...`, so filtering uses the DynamoDB index rather than the browser.
+- **Create, edit, delete.** One `TaskForm` component handles both creating and editing. Status can also be changed inline from each row. Deletes ask for confirmation.
+- **Loading, empty and error states.**
+  - A loading message shows while fetching.
+  - The empty state is filter-aware ("No tasks yet" vs. "No tasks with status 'To do'").
+  - A failed load shows a message with a "Try again" button.
+- **Readable errors.**
+  - Validation messages from the API (`400`) appear next to the form.
+  - Network failures, throttling (`429`) and server errors (`5xx`) get friendly messages.
+  - If a task was deleted somewhere else, a stale edit or status change removes it from the list and explains why. Deleting an already-deleted task counts as success.
+- **Config.** The API base URL comes from `VITE_API_URL`, a Vite environment variable baked in at build time. Only variables prefixed `VITE_` are exposed to browser code, so nothing secret belongs there.
 
 ## Running tests
 
@@ -186,17 +218,85 @@ Stop everything: `Ctrl+C` in the `sam local` terminal, then `docker compose down
 cd backend
 npm test            # Vitest unit tests (no AWS calls)
 npm run typecheck   # TypeScript type check
+
+cd ../frontend
+npm run build       # type-checks and builds the frontend
 ```
 
 The tests call the real handler with API Gateway-shaped events and an in-memory repository. They cover every route, validation failures, 404s, CORS headers and generic 500s.
 
 ## Deployment
 
-_Coming in a later step._
+> ⚠️ Deploying creates billable AWS resources. At personal-project traffic the cost is a few cents at most, and on the AWS Free plan it's covered by credits. Clean up when you're done (see below).
+
+**Prerequisites:** AWS CLI configured (`aws sts get-caller-identity` works) and `npm install` already run in `backend/`.
+
+```bash
+sam build      # bundle the Lambda with esbuild into .aws-sam/
+sam deploy     # shows the change set, waits for "y", then creates/updates the stack
+```
+
+`samconfig.toml` supplies the stack name (`serverless-task-tracker`), region (`us-east-2`), parameters and `CAPABILITY_IAM`, so no `--guided` run is needed. On the first deploy, SAM also creates a small helper stack, `aws-sam-cli-managed-default`, holding an S3 bucket for the uploaded code.
+
+When the deploy finishes, copy the `ApiUrl` output into `frontend/.env.local`:
+
+```bash
+VITE_API_URL=https://<api-id>.execute-api.us-east-2.amazonaws.com/dev
+```
+
+**Change the allowed CORS origin** (e.g. once the frontend is hosted somewhere):
+
+```bash
+sam deploy --parameter-overrides Stage=dev AllowedOrigin=https://tasks.example.com
+```
+
+**Look at logs:** in the AWS Console under CloudWatch → Log groups → `/aws/lambda/serverless-task-tracker-task-function`, or from the terminal:
+
+```bash
+sam logs --stack-name serverless-task-tracker --tail
+```
+
+Each request logs a JSON line such as `{"level":"INFO","requestId":"...","message":"POST /tasks -> 201"}`. Lambda's own `platform.report` lines show duration, memory and cold-start init time. Measured on the deployed stack: about 34 ms per warm request, about 345 ms cold-start init, and 106 MB of the 256 MB allocated.
 
 ## Cleanup
 
-_Coming in a later step._
+Delete everything so nothing keeps costing money. There are two CloudFormation stacks in **us-east-2**.
+
+**1. The app stack.** Removes the API, Lambda, DynamoDB table (**and all task data**), IAM role and log group:
+
+```bash
+sam delete --stack-name serverless-task-tracker --region us-east-2
+```
+
+Answer `y` to both prompts (delete the stack, and delete its artifacts in S3).
+
+**2. SAM's helper stack and its S3 bucket.** The bucket has versioning enabled, and CloudFormation can only delete an empty bucket, so empty it first:
+
+1. AWS Console → **S3** → bucket `aws-sam-cli-managed-default-samclisourcebucket-...` → **Empty** → type `permanently delete` → confirm. This removes all object versions.
+2. Delete the helper stack (this also deletes the now-empty bucket):
+
+   ```bash
+   aws cloudformation delete-stack --stack-name aws-sam-cli-managed-default --region us-east-2
+   aws cloudformation wait stack-delete-complete --stack-name aws-sam-cli-managed-default --region us-east-2
+   ```
+
+**3. Verify.** Both commands should print nothing:
+
+```bash
+aws cloudformation list-stacks --region us-east-2 --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE --query "StackSummaries[].StackName" --output text
+aws s3 ls | grep aws-sam-cli-managed-default
+```
+
+Locally, `docker compose down` stops DynamoDB Local.
+
+## Lessons learned
+
+- **DynamoDB is designed around access patterns.** The key design and GSI came from listing the three reads the app needs, not from a table schema. Filtering through an index (`Query`) instead of a `Scan` + `FilterExpression` is the difference between reading the matching items and reading the whole table.
+- **Keep AWS out of the core logic.** Putting DynamoDB behind a `TaskRepository` interface made the handler testable with a 30-line in-memory fake, so 31 tests run in under a second without touching AWS.
+- **SAM's esbuild build has sharp edges.** In `build_in_source` mode, SAM runs a production `npm install` inside the source folder, which removed the dev dependencies (esbuild, Vitest, TypeScript) from `backend/node_modules`. Pointing `CodeUri` at `backend/src`, which has no `package.json`, makes SAM bundle in place without touching `node_modules`, and lets esbuild follow imports into `../shared`.
+- **Debugging an Organizations SCP.** The first deploy failed with an *explicit deny in a service control policy*. AdministratorAccess on the IAM user couldn't override it, and the policy wasn't readable from the member account. Running `aws iam simulate-principal-policy` (which reports whether Organizations allows each action) against the actions SAM needs showed that CloudFormation, Lambda, DynamoDB and S3 were denied in every region **except `us-east-2`**: an `aws:RequestedRegion` guardrail. The fix was to deploy to the allowed region, not to loosen the guardrail.
+- **With Lambda proxy integration, CORS is split between two places.** API Gateway answers the `OPTIONS` preflight, but the Lambda must add `Access-Control-Allow-Origin` to its own responses, and API Gateway's own errors (throttling, unknown routes) need gateway responses with the header too. Otherwise the browser hides the real error.
+- **Log retention is opt-in.** By default, Lambda log groups keep data forever. Defining the log group in the template with `RetentionInDays: 14` fixes that, and also means it's deleted with the stack.
 
 ## Future improvements
 

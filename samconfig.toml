@@ -3,7 +3,8 @@ version = 0.1
 
 [default.global.parameters]
 stack_name = "serverless-task-tracker"
-region = "us-east-1"
+# This AWS account's guardrail policy (an Organizations SCP) only allows us-east-2.
+region = "us-east-2"
 
 [default.build.parameters]
 cached = true
